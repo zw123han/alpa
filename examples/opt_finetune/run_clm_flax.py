@@ -41,7 +41,7 @@ from tqdm import tqdm
 
 import alpa
 from alpa.model.model_util import DynamicScale, TrainState
-from alpa import AutoShardingOption, AutoLayerOption, ManualStageOption
+from alpa import AutoShardingOption, AutoLayerOption, ManualStageOption, CreateStateParallel
 import jax
 import jax.numpy as jnp
 import optax
@@ -545,28 +545,6 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    if model_args.model_name_or_path:
-        model = FlaxAutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            config=config,
-            seed=training_args.seed,
-            dtype=getattr(jnp, model_args.dtype),
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-        #from transformers import FlaxOPTForCausalLM
-        #config.num_hidden_layers = 2
-        #model = FlaxOPTForCausalLM(
-        #    config=config,
-        #    seed=training_args.seed,
-        #    dtype=getattr(jnp, model_args.dtype),
-        #)
-    else:
-        model = FlaxAutoModelForCausalLM.from_config(
-            config,
-            seed=training_args.seed,
-            dtype=getattr(jnp, model_args.dtype),
-        )
-
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     if training_args.do_train:
@@ -727,35 +705,61 @@ def main():
         }
         return traverse_util.unflatten_dict(flat_mask)
 
-    # create adam optimizer
-    if training_args.adafactor:
-        # We use the default parameters here to initialize adafactor,
-        # For more details about the parameters please check https://github.com/deepmind/optax/blob/ed02befef9bf81cbbf236be3d2b0e032e9ed4a40/optax/_src/alias.py#L74
-        optimizer = optax.adafactor(
-            learning_rate=linear_decay_lr_schedule_fn,
+    if model_args.model_name_or_path:
+        model, params = FlaxAutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            seed=training_args.seed,
+            dtype=getattr(jnp, model_args.dtype),
+            use_auth_token=True if model_args.use_auth_token else None,
+            _do_init = False, # https://github.com/huggingface/transformers/issues/15766
         )
     else:
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adamw(
-                learning_rate=linear_decay_lr_schedule_fn,
-                b1=training_args.adam_beta1,
-                b2=training_args.adam_beta2,
-                eps=training_args.adam_epsilon,
-                weight_decay=training_args.weight_decay,
-                mask=decay_mask_fn)
+         model, params = FlaxAutoModelForCausalLM.from_config(
+            config,
+            seed=training_args.seed,
+            dtype=getattr(jnp, model_args.dtype),
+            _do_init = False,
         )
 
-    # Setup train state
-    if model_args.dtype == "float16":
-        use_master_copy = True
-        dynamic_scale = DynamicScale()
-        # Fix a bug in huggingface's implementation (https://github.com/huggingface/transformers/pull/18462)
-        alpa.global_config.flax_always_use_fp16_embedding = True
-    else:
-        use_master_copy = dynamic_scale = None
-    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer,
-                              dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
+    def create_state(params): # must pass params as parameter, otherwise parallelization will only execute on cpu
+        params = model.init_weights(model.key, model.input_shape, params).unfreeze() # optax expects unfrozen parameters https://github.com/deepmind/optax/issues/160
+        
+        # model = FlaxAutoModelForCausalLM.from_config(
+        #     config,
+        #     seed=training_args.seed,
+        #     dtype=getattr(jnp, model_args.dtype),
+        # )
+
+        # create adam optimizer
+        if training_args.adafactor:
+            # We use the default parameters here to initialize adafactor,
+            # For more details about the parameters please check https://github.com/deepmind/optax/blob/ed02befef9bf81cbbf236be3d2b0e032e9ed4a40/optax/_src/alias.py#L74
+            optimizer = optax.adafactor(
+                learning_rate=linear_decay_lr_schedule_fn,
+            )
+        else:
+            optimizer = optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.adamw(
+                    learning_rate=linear_decay_lr_schedule_fn,
+                    b1=training_args.adam_beta1,
+                    b2=training_args.adam_beta2,
+                    eps=training_args.adam_epsilon,
+                    weight_decay=training_args.weight_decay,
+                    mask=decay_mask_fn)
+            )
+
+        # Setup train state
+        if model_args.dtype == "float16":
+            use_master_copy = True
+            dynamic_scale = DynamicScale()
+            # Fix a bug in huggingface's implementation (https://github.com/huggingface/transformers/pull/18462)
+            alpa.global_config.flax_always_use_fp16_embedding = True
+        else:
+            use_master_copy = dynamic_scale = None
+        return TrainState.create(apply_fn=model.__call__, params=params, tx=optimizer,
+                                dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
 
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
@@ -812,11 +816,22 @@ def main():
         return metrics
 
     # Create parallel version of the train and eval step
-    method = alpa.get_3d_parallel_method(
+    
+    # parallel methods: https://github.com/alpa-projects/alpa/blob/main/alpa/parallel_method.py
+    
+    # shard parallel (1D)
+    # method = alpa.ShardParallel(num_micro_batches=16) # this works
+
+    # # pipeline + shard parallel (2D)
+    # method = alpa.PipeshardParallel(num_micro_batches=2) # this doesn't work
+
+    # # data + pipeline + shard parallel (3D)
+    method = alpa.get_3d_parallel_method( # this doesn't work
             num_micro_batches=training_args.num_micro_batches,
             data_parallel=-1,
             operator_parallel=training_args.operator_parallel,
             pipeline_parallel=training_args.pipeline_parallel)
+
 
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
@@ -824,6 +839,21 @@ def main():
     p_eval_step = alpa.parallelize(eval_step,
                                    method=alpa.FollowParallel(
                                        p_train_step, num_micro_batches=eval_num_micro_batches))
+    
+    ### TODO try to, extra overhead for calculating batch
+    rng, input_rng = jax.random.split(rng)
+    train_loader = data_loader(input_rng, train_dataset, train_batch_size,
+                                   train_min_batch_size, shuffle=True)
+    batch = next(train_loader)
+    ###
+
+    # dist init: https://github.com/alpa-projects/alpa/blob/main/alpa/parallel_method.py
+    # usage: https://github.com/alpa-projects/alpa/blob/main/tests/runtime/test_create_state.py
+    p_create_state = alpa.parallelize(create_state, 
+                                   method=CreateStateParallel(
+                                       p_train_step, batch)) # note: parallelized func name is "p_train_step" not "train_step"
+    logger.info("***** Initializing model and creating optimizer state *****")
+    state = p_create_state(params)
 
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
