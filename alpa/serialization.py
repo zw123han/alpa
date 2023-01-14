@@ -157,7 +157,6 @@ def restore_checkpoint(ckpt_dir: Union[str, os.PathLike], step: int,
     flat_load_state = []
     mesh_group = get_global_virtual_physical_mesh().launched_physical_mesh_group
 
-    
     for path, info in zip(state_paths, flat_info):
         if info is None:
             logger.warning("Variable is not used, skip loading it")
