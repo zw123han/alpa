@@ -15,7 +15,7 @@ import msgpack
 import numpy as np
 
 from alpa.device_mesh import (DistributedArray, ReplicatedDistributedArray,
-                              get_global_virtual_physical_mesh)
+                              get_global_virtual_physical_mesh, get_global_physical_mesh)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -155,19 +155,22 @@ def restore_checkpoint(ckpt_dir: Union[str, os.PathLike], step: int,
     state_paths, state_tree = tree_flatten(metadata)
     flat_info = tree_leaves(placement_specs)
     flat_load_state = []
-    mesh_group = get_global_virtual_physical_mesh().launched_physical_mesh_group
-    assert mesh_group is not None
+    mesh_group = get_global_virtual_physical_mesh().launched_physical_mesh_group 
+    #assert mesh_group is not None 
 
     for path, info in zip(state_paths, flat_info):
         if info is None:
             logger.warning("Variable is not used, skip loading it")
             flat_load_state.append(None)
-        if len(info.mesh_ids) == 1:
+        
+        if len(info.mesh_ids) == 1:  
             dist_arr = DistributedArray.load(os.path.join(ckpt_dir,
-                                                          path), info.aval,
-                                             mesh_group[info.mesh_ids[0]],
-                                             info.sharding_specs[0])
+                                                        path), info.aval,
+                                            mesh_group[info.mesh_ids[0]] if mesh_group is not None else get_global_physical_mesh(), # handle case of PhysicalDeviceMesh without PhysicalDeviceMeshGroup (i.e. no pipeline parallel)
+                                            info.sharding_specs[0])                            
             flat_load_state.append(dist_arr)
+        
+
         else:
             meshes, arrays = [], []
             for mesh_id, spec in zip(info.mesh_ids, info.sharding_specs):
